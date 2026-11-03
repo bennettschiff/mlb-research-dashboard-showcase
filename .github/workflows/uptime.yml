@@ -1,0 +1,112 @@
+name: Uptime check
+
+# External health monitor for the live sites. ops-alert.yml watches this
+# workflow and opens a GitHub issue (→ email) when it fails, so a real outage
+# is no longer invisible. Companion to ops-alert, which only catches *workflow*
+# failures — this catches the *site itself* being down (bad deploy, expired
+# domain/cert, Vercel/Supabase outage, deleted APP_ACCESS_CODE).
+#
+# Self-hosted alternative to UptimeRobot: no third-party account, lives in the
+# repo, alerts through the same channel as everything else.
+#
+# Transient blips are retried (3 attempts, 20s apart) before failing, so a
+# single flaky network moment doesn't open an issue.
+#
+# NOTE: this workflow is in ops-alert.yml's watch list — keep it there. It matches
+# by workflow NAME, so renaming this file's `name:` silently breaks alerting and
+# both must change in the same commit. The name is deliberately cadence-free now
+# (was "Uptime check (hourly)") so future cadence tuning can't desync the two.
+#
+# Cadence economics: every run bills a FULL minute even though the probe takes
+# ~10 s, so cost is set purely by run count. This is the worst minutes-per-value
+# job in the fleet — at hourly it can reach ~740 min/mo, 37% of the 2000-min cap,
+# to curl five URLs. */15 was worse on paper (2880/mo scheduled) but GitHub
+# throttles this account hard and only delivered ~13.4 runs/day (14%), which is
+# why the real bill never matched the cron. Throttling is not a budget: it is
+# undocumented, unmeasured at this cadence, and can stop at any time.
+# Every 3 h is a HARD ceiling of 8 runs/day (~248 min/mo) that holds even at 100%
+# delivery, in exchange for <=3 h detection latency on a silent outage — an
+# outage you'd notice yourself the moment you opened the site. (2026-07-29 cap
+# exhaustion review.)
+#
+# 2026-08-18: widened to every 12 h (2 runs/day, ~62 min/mo). This workflow was
+# manually disabled on 07-25 during the quota emergency and never switched back
+# on — the 07-29 cadence commit above was written four days AFTER it had already
+# stopped running, so the file's intent and its actual state had disagreed ever
+# since. Re-enabling it needs somewhere to put the minutes: the rest of the fleet
+# now projects to ~1833 of 2000 for August (measured from run durations, skipped
+# runs excluded), leaving ~167 min of headroom — 3 h (~248) overruns it outright
+# and even 6 h (~124) would spend three quarters of what is left. 12 h takes a
+# quarter of the headroom instead, which is the point: this probe is the cheapest
+# thing to starve and the last thing that should be the reason the cap is hit
+# again. Worst-case detection latency is 12 h, acceptable for a check that exists
+# to catch an outage you have not opened the site to notice yet.
+
+on:
+  # Production runs this on a cron schedule. The public copy is manual-only,
+  # so a fork without secrets never fires it.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Probe live endpoints
+        run: |
+          set -u
+
+          # Homepages — must return 200.
+          PAGES=(
+            "https://schiffpicks.com"
+            "https://nhl.schiffpicks.com"
+            "https://wnba.schiffpicks.com"
+            "https://nfl.schiffpicks.com"
+          )
+
+          # Serverless health — any non-5xx means the function is alive.
+          # /api/auth POST returns 401 (gate enforcing) or 200 (env unset);
+          # a 5xx / timeout / connection error means the backend is down.
+          API="https://schiffpicks.com/api/auth"
+
+          fails=""
+
+          # Returns 0 if healthy, 1 otherwise. Retries up to 3 times, 20s apart,
+          # so only a sustained outage is reported.
+          check() {
+            local url="$1" mode="$2" attempt code
+            for attempt in 1 2 3; do
+              if [ "$mode" = "api" ]; then
+                code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 -X POST \
+                  -H "Content-Type: application/json" -d '{}' "$url" || echo 000)
+                # Healthy = any response below 500 (function answered).
+                if [ "$code" != "000" ] && [ "$code" -lt 500 ]; then return 0; fi
+              else
+                code=$(curl -s -o /dev/null -w "%{http_code}" -m 20 "$url" || echo 000)
+                if [ "$code" = "200" ]; then return 0; fi
+              fi
+              echo "  attempt $attempt: $url -> $code"
+              [ "$attempt" -lt 3 ] && sleep 20
+            done
+            echo "DOWN: $url (last status $code)"
+            return 1
+          }
+
+          for u in "${PAGES[@]}"; do
+            echo "Checking $u"
+            check "$u" page || fails="$fails $u"
+          done
+
+          echo "Checking $API (api)"
+          check "$API" api || fails="$fails $API"
+
+          if [ -n "$fails" ]; then
+            echo ""
+            echo "❌ Unhealthy endpoints:$fails"
+            exit 1
+          fi
+          echo ""
+          echo "✅ All endpoints healthy"

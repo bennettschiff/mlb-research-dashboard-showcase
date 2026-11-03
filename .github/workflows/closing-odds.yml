@@ -1,0 +1,27 @@
+name: Closing odds snapshot + CLV
+
+# 22:45 UTC = 6:45 PM ET — right before the bulk of first pitches. Fetches the
+# closing prop/game lines and stamps today's picks with closing_odds + clv_pct.
+# West-coast games close later; one snapshot is an accepted approximation.
+on:
+  # Production runs this on a cron schedule. The public copy is manual-only,
+  # so a fork without secrets never fires it.
+  workflow_dispatch:
+
+jobs:
+  closing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Trigger closing-odds capture
+        run: |
+          RESPONSE=$(curl -s -w "\n---HTTP_STATUS:%{http_code}" \
+            "https://${{ secrets.VERCEL_APP_URL }}/api/cron?secret=${{ secrets.CRON_SECRET }}&scope=closing-odds")
+          HTTP_STATUS=$(echo "$RESPONSE" | grep -o 'HTTP_STATUS:[0-9]*' | cut -d: -f2)
+          BODY=$(echo "$RESPONSE" | sed '/---HTTP_STATUS/d')
+          echo "Status: $HTTP_STATUS"
+          echo "Body: $BODY"
+          if [ "$HTTP_STATUS" -ne 200 ]; then
+            echo "❌ closing-odds returned $HTTP_STATUS"
+            exit 1
+          fi

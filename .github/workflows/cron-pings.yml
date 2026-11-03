@@ -1,0 +1,170 @@
+name: Cron pings (lineups + closing capture)
+
+# ONE job that fires BOTH half-hourly pings, replacing "Lineup refresh (every 30
+# min)" and "Progressive closing capture (every 30 min)".
+#
+# WHY MERGE: GitHub bills a 1-minute MINIMUM per job. Both workflows did nothing
+# but curl /api/cron — work that finishes in seconds — yet together they burned
+# 759 min in Aug 1–29 (420 + 247 runs), which was 42% of this repo's entire
+# Actions consumption and the single largest line item against the 2000 min/mo
+# private-repo cap that both labs share. The cost was never the work; it was the
+# job count. Two curls in one job bill one minute instead of two, cutting ~220
+# min/mo with ZERO loss of coverage: same 30-minute grid, same scopes, same
+# handler-side capture windows.
+#
+# The two schedules were not identical, so this runs their UNION (13:00–03:00 UTC)
+# and each scope is gated to the hours it actually needs. A gated-off scope costs
+# nothing — it is a skipped shell branch inside a job that was already billed.
+#   lineups            13–23, 00–02 UTC  (unchanged)
+#   progressive-close  16–23, 00–03 UTC  (unchanged)
+#
+# Both scopes run even if the first fails, and the job fails if EITHER did, so
+# ops-alert still sees one broken scope. Watch-list entry updated in ops-alert.yml.
+
+on:
+  # Production runs this on a cron schedule. The public copy is manual-only,
+  # so a fork without secrets never fires it.
+  workflow_dispatch:
+
+permissions:
+  contents: read   # required for actions/checkout once a permissions block exists
+  issues: write    # the health probe opens its own alarm issue (see below)
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+
+    steps:
+      - name: Ping the scopes due this hour
+        env:
+          APP_URL: ${{ secrets.VERCEL_APP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -uo pipefail
+
+          # 10# forces base-10: an hour like "08" or "09" is an INVALID OCTAL
+          # literal in bash arithmetic and would abort the step outright at
+          # 08:00/09:00 UTC. Those hours are outside this grid today, but a
+          # schedule edit must not be able to reintroduce a time-of-day landmine.
+          HOUR=$((10#$(date -u +%H)))
+          echo "UTC hour: $HOUR"
+
+          rc=0
+
+          run_scope() {
+            scope="$1"
+            echo "──────── $scope ────────"
+            # --retry 3 with --retry-all-errors covers the transient 5xx/504 blips
+            # that a bare curl reports as a hard failure (a Supabase 504 killed a
+            # daily-picks run on 2026-08-28 while the data underneath was fine).
+            # -sS keeps it quiet but still prints real curl errors.
+            status=$(curl -sS -o /tmp/body.$scope -w '%{http_code}' \
+              --max-time 120 --retry 3 --retry-delay 5 --retry-all-errors \
+              "https://${APP_URL}/api/cron?scope=${scope}&secret=${CRON_SECRET}") || status="000"
+            echo "status: $status"
+            echo "body:"; head -c 2000 "/tmp/body.$scope" || true; echo
+            if [ "$status" != "200" ]; then
+              echo "::error::$scope returned $status"
+              rc=1
+            else
+              echo "✅ $scope ok"
+            fi
+          }
+
+          # Hour windows mirror the two schedules this workflow replaced.
+          if [ "$HOUR" -ge 13 ] || [ "$HOUR" -le 2 ]; then
+            run_scope lineups
+          else
+            echo "skip lineups (hour $HOUR outside 13-23,0-2)"
+          fi
+
+          if [ "$HOUR" -ge 16 ] || [ "$HOUR" -le 3 ]; then
+            run_scope progressive-close
+          else
+            echo "skip progressive-close (hour $HOUR outside 16-23,0-3)"
+          fi
+
+          exit $rc
+
+      # ── Database health ────────────────────────────────────────────────────
+      # Rides along in this ALREADY-BILLED job on purpose. GitHub charges a
+      # 1-minute minimum per job, so a dedicated wedge monitor at this cadence
+      # would cost ~500 min/mo and immediately spend the ~220 min the merge
+      # above just saved. Here it is free, and it gives 30-minute detection
+      # across the whole active window (13:00–03:00 UTC ≈ 9am–11pm ET).
+      #
+      # `if: always()` so a failing ping never skips the probe — a wedged
+      # database is the most likely REASON the pings failed, and that is
+      # precisely when the diagnosis is worth having.
+      - name: Checkout
+        if: always()
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        if: always()
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          check-latest: true   # runner cache lags security releases
+
+
+      # Exit codes are load-bearing and MUST stay distinct. capacity-check.yml
+      # documents why: collapsing "alarm" into "failure" made ops-alert file a
+      # duplicate issue and left a permanent red X on a job that was working.
+      #   2 = ALARM       — real wedge. Opens an issue here; the RUN STAYS GREEN.
+      #   1 = BROKEN CHECK — bad credentials / unusable response. Fails the job,
+      #                      which is correct: ops-alert should see that.
+      #   0 = healthy.
+      # `|| code=$?` captures the status without `set -e` killing the step first.
+      - name: Probe SERVE Postgres
+        id: health
+        if: always()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          # Optional. When set, serve-health.mjs performs the same restart that
+          # fixed the 08-25 and 08-29 wedges by hand. Absent, it detects and
+          # reports but cannot act. Create one at
+          # https://supabase.com/dashboard/account/tokens and add it as the repo
+          # secret SUPABASE_ACCESS_TOKEN to turn detection into auto-healing.
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+        run: |
+          code=0
+          node scripts/serve-health.mjs || code=$?
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = "1" ]; then
+            echo "::error::SERVE health check is broken (not a database outage) — see output above."
+            exit 1
+          fi
+          exit 0
+
+      # Opens its own issue rather than routing through ops-alert.yml, for the
+      # reason capacity-check.yml already documents: workflow_run delivery is
+      # best-effort and was measured at 11% on the WNBA repo. A last-line alarm
+      # must not depend on it.
+      - name: Alarm on a wedged database
+        if: always() && steps.health.outputs.code == '2'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          TITLE="🚨 SERVE Postgres wedged (database not answering)"
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$TITLE\"" --json number,title \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          BODY=$(printf '%s\n' \
+            "The health probe could not complete a query against SERVE." \
+            "" \
+            "See [the run]($RUN_URL) for whether an auto-restart was attempted and whether it recovered." \
+            "" \
+            "Both prior wedges (2026-08-25, 2026-08-29) were fixed by a project restart with no data loss:" \
+            "https://supabase.com/dashboard/project/<project-ref>/settings/general → Restart project" \
+            "" \
+            "Close this issue once SERVE is answering again.")
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
+          fi

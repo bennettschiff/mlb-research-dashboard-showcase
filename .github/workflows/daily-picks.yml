@@ -1,0 +1,266 @@
+name: Daily picks save + score
+
+# Why this exists: auto-save and auto-score are browser useEffects in App.jsx
+# with no server-side equivalent. Without a live browser session, picks for the
+# day never persist and prior-day picks never grade. This action drives the
+# deployed app in headless Chromium so the same code paths execute unattended.
+#
+# Companion: morning-score.yml runs the same driver in --score-only mode at
+# 7 AM ET so yesterday's results are visible early. This workflow still scores
+# too (the noon score side is usually a no-op by then) and owns the save path.
+#
+# Schedule reasoning (cron is UTC; ET shown is DST → standard offset):
+#   - 16:30 UTC = 12:30 PM ET (DST) / 11:30 AM ET (standard).
+#     ~5 h after the 7:30 AM ET morning warm-up; before the 1:05 PM ET early
+#     games. Captures the full slate; on the same load, auto-score fires for
+#     yesterday's pending picks (whose games finished overnight).
+#   - 22:00 UTC = 6 PM ET (DST) / 5 PM ET (standard) — backstop.
+#     Any picks missed at noon still save (the lock-filter bug is fixed) and
+#     finished same-day games can grade; west-coast stragglers grade at the
+#     7 AM ET morning-score run.
+#     Delivery-delay history — this is the THIRD attempt at this slot, so keep
+#     the margin. 03:30 UTC (11:30 PM ET) landed past midnight ET and was moved
+#     to 01:30 UTC (9:30 PM ET) on the assumption GitHub delivers at most ~2.5 h
+#     late (2026-07-14/16/17 failures). It delivers later than that: through
+#     2026-07 the 01:30 cron actually started 04:42-05:11 UTC — 3.2-3.7 h late,
+#     i.e. 12:42-1:11 AM ET — so every run landed AFTER midnight ET. Past midnight
+#     `today` has rolled over, so the app's etHour>=11 save gate can never open
+#     and the save is skipped 100% of the time — the backstop had no effect for
+#     the whole month while still billing ~16 min a night (see the stall bail in
+#     scripts/daily-picks.mjs). 22:00 UTC leaves ~6 h of slack before midnight
+#     ET, so even a 3 h delay keeps the run on its own slate day.
+
+on:
+  # Production runs this on a cron schedule. The public copy is manual-only,
+  # so a fork without secrets never fires it.
+  workflow_dispatch:
+
+# A permissions block REPLACES the default token scopes rather than adding to
+# them, so every scope this job needs must be listed here. contents: read is
+# what actions/checkout uses to fetch a private repo; without it GitHub returns
+# "remote: Repository not found" (a 403 masked as a 404, not a real 404), which
+# reads like an infra blip and is why this was misdiagnosed as transient.
+# Guarded by scripts/workflow-permissions.test.js.
+permissions:
+  contents: read   # actions/checkout — load-bearing, see above
+  issues: write    # self-alert step opens/comments the failure issue
+  actions: write   # "Retry once before alerting" step calls `gh workflow run`
+
+jobs:
+  drive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          check-latest: true   # runner cache lags security releases
+
+      # Cache the ~150MB chromium binary between runs. Reinstalling it every run
+      # was ~10-14 min of this job's ~16 min wall clock, twice a day — the single
+      # largest Actions-minutes sink in the repo (2026-07-25 burn review). --with-deps
+      # is kept so the OS-level libs are always ensured (apt is fast when already
+      # present); only the browser DOWNLOAD is what the cache elides.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-1.49.0
+
+      # Step timeout, not just the job's: on 2026-08-18 the apt-get inside
+      # --with-deps hung on an unreachable azure.archive.ubuntu.com mirror and sat
+      # there for 24 of the job's 25 minutes, so the run was cancelled before the
+      # driver, the Brain Trust snapshot or the Golden boards ever executed — the
+      # day's boards read "No board written for this date" all slate long. Capping
+      # the step surfaces that class of hang in 8 minutes instead of burning the
+      # whole budget, and leaves the rest of the job's time unspent.
+      #
+      # It happened AGAIN the very next day (2026-08-19, run 32278411599): apt got
+      # two InRelease files off archive.ubuntu.com and then stalled dead for the
+      # full 8 minutes. So capping the step is not enough — a step cap converts a
+      # hang into a failed run, and the noon slot is still lost either way. Twice
+      # in two days makes the apt mirror a standing dependency, not a fluke.
+      #
+      # The split below removes it from the critical path. Only `install-deps`
+      # touches apt; the browser download is a separate, cached, CDN-backed
+      # operation. So:
+      #   - deps are BEST-EFFORT: bounded by `timeout` (not just the step cap, so
+      #     a hang costs 2 min instead of the whole step), tried twice, and a
+      #     failure is a warning rather than a job kill. ubuntu-latest already
+      #     ships the shared libs headless chromium needs — Chrome/Firefox/Edge
+      #     are preinstalled on the image — so --with-deps is belt-and-braces. If
+      #     a lib genuinely IS missing the driver step fails right after with a
+      #     clear "error while loading shared libraries", which is a better
+      #     signal than dying on apt.
+      #   - the browser install is the only HARD requirement, and it retries:
+      #     with a cache hit it is a no-op, on a miss it is a ~150 MB CDN
+      #     download that deserves more than one shot at the network.
+      #
+      # The inner bounds are sized to fit the step cap rather than race it:
+      # 2×120 s deps + 3×120 s browser = 10 min worst case under a 12 min cap, so
+      # every path here ends in a message rather than an opaque step timeout, and
+      # the job's 25 min still leaves ~13 min for the driver (which runs in 1-3).
+      - name: Install Playwright + chromium
+        timeout-minutes: 12
+        run: |
+          npm install --no-save playwright@1.49.0
+
+          if timeout -k 10 120 npx playwright install-deps chromium \
+            || timeout -k 10 120 npx playwright install-deps chromium; then
+            echo "System deps ensured."
+          else
+            echo "::warning::playwright install-deps failed or hung twice (apt mirror unreachable) — continuing on the runner image's own libs. If chromium cannot launch, the driver step below will say so."
+          fi
+
+          for attempt in 1 2 3; do
+            if timeout -k 10 120 npx playwright install chromium; then
+              echo "chromium ready (attempt $attempt)."
+              exit 0
+            fi
+            echo "playwright install chromium attempt $attempt failed; retrying."
+          done
+          echo "::error::playwright install chromium failed after 3 attempts."
+          exit 1
+
+      - name: Run daily picks driver
+        env:
+          APP_URL: https://${{ secrets.VERCEL_APP_URL }}
+          APP_ACCESS_CODE: ${{ secrets.APP_ACCESS_CODE }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LAB_SUPABASE_URL: ${{ secrets.LAB_SUPABASE_URL }}
+          LAB_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.LAB_SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/daily-picks.mjs
+
+      # Brain Trust capture: by now the driver has triggered the scan (daily_scan_results)
+      # and odds fetch (daily_odds) for today, so snapshot the per-line predictions + value/safe
+      # parlays server-side for forward grading (morning-score.yml grades them next AM). Soft-skips
+      # (exit 0) if the scan/odds haven't landed, so it never false-alarms ops-alert.
+      - name: Snapshot Brain Trust predictions + parlays
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LAB_SUPABASE_URL: ${{ secrets.LAB_SUPABASE_URL }}
+          LAB_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.LAB_SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/brain-trust-snapshot.mjs --snapshot
+
+      # Golden boards for TODAY. The Golden tab renders the three boards read-only
+      # from golden_snapshots, so without this step nothing writes the current
+      # day's rows and the tab shows "No board written for this date" all slate
+      # long — the boards only appeared retroactively when morning-score.yml built
+      # YESTERDAY's the next morning. (The legacy Golden 10 below them kept
+      # rendering because it is computed client-side from the in-browser scan and
+      # never touches the table, which is what made the gap look like a bug in the
+      # new boards.)
+      #
+      # Runs immediately after the Brain Trust snapshot: that surface is this
+      # script's substrate, and the NRFI candidates it appends come from the
+      # mlb_picks rows the driver step just saved. No --force, so the 6 PM backstop
+      # run leaves the noon board alone — once a board is locked it stays locked.
+      # Soft-skips (exit 0) when the surface is missing, same as the step above.
+      - name: Snapshot today's Golden boards
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LAB_SUPABASE_URL: ${{ secrets.LAB_SUPABASE_URL }}
+          LAB_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.LAB_SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/golden-snapshot.mjs
+
+      # Scan-blob write is the single point of loss: picks can save fine while the
+      # daily_scan_results upsert silently fails, and the gap is permanent (7 of 14
+      # game days lost through 7/12 — docs/plumbing-audit-2026-07-13.md P1). The
+      # driver exits 0 either way and the brain-trust step soft-skips, so nothing
+      # upstream catches it. Verify the row actually landed and fail the run if not,
+      # which fires the retry + alert steps below.
+      #
+      # The full rationale — ET slate-day arithmetic, the 11 AM save gate, gameType=R,
+      # the 2 MB-row select, and the retry schedule — lives in the script's header.
+      # It moved out of this file on 2026-08-28: as six lines of `curl -sf` under
+      # `bash -e`, a single Supabase 504 (edge_logs 06:06:27Z, inside a ~70 s window
+      # of gateway errors) killed the step with nothing in the log but "Process
+      # completed with exit code 22" — while the row was present the whole time. The
+      # script retries the gateway class for ~110 s and reports "row missing" and
+      # "could not ask" as different failures with different exit codes.
+      - name: Verify scan blob persisted
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LAB_SUPABASE_URL: ${{ secrets.LAB_SUPABASE_URL }}
+          LAB_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.LAB_SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/verify-scan-blob.mjs
+
+      # Self-alert on failure instead of relying solely on ops-alert.yml's
+      # workflow_run listener. Investigated 2026-07-15: this workflow failed
+      # twice (7/13, 7/14 — both now-fixed All-Star-break edge cases) and
+      # ops-alert never fired for either one — no workflow_run event was ever
+      # delivered to it, despite "Daily picks save + score" being correctly on
+      # its watch list. workflow_run is a best-effort GitHub webhook, not a
+      # guarantee, and this workflow (longest-running, heaviest job in the repo)
+      # appears to be a standing blind spot for it — 20 failed/cancelled runs
+      # in its history, zero ops-alert issues ever filed. Firing the same
+      # dedup'd issue directly from this job removes that dependency entirely.
+      # Same title as ops-alert would use, so if ops-alert's listener DOES fire
+      # for a future failure, they dedupe onto the same issue instead of
+      # opening two. Also fires on cancelled() (timeout-minutes kill), the
+      # same "not reported as failure" gap ops-alert itself was patched for.
+      # Retry ONCE, in-job, before alerting. ops-alert.yml has an auto-retry, but
+      # it cannot help this workflow: its retry fires only on conclusion
+      # 'failure', never 'cancelled' (a timeout kill), and — as the note below
+      # documents — the workflow_run event for this job is frequently never
+      # delivered at all, so on 2026-08-18 ops-alert did not run for the
+      # cancellation. Result: a transient infra kill at 12:30 ET left the slate
+      # with no Golden boards until the 6 PM ET backstop, i.e. past the window
+      # the boards are for. Every step in the job is idempotent, so a redundant
+      # extra attempt is a no-op.
+      #
+      # 2026-08-19: that retry had NEVER once fired. `gh run rerun` cannot rerun
+      # the run it is called from — the job is still in progress, so GitHub
+      # answers "run <id> cannot be rerun; This workflow is already running" and
+      # both the --failed and the plain form fail. The step was dead the day it
+      # shipped and the 08-19 apt hang went straight to the alert branch.
+      # Dispatch a FRESH run instead, which has no such restriction.
+      #
+      # Bounded at exactly one extra attempt by the event_name guard rather than
+      # run_attempt: the dispatched run's event is `workflow_dispatch`, so it
+      # cannot dispatch another one. (run_attempt would not bound it — a new run
+      # always starts at attempt 1, which is how this becomes an infinite loop.)
+      - name: Retry once before alerting
+        id: selfretry
+        if: (failure() || cancelled()) && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh workflow run daily-picks.yml --ref "$GITHUB_REF_NAME"; then
+            echo "Dispatched a fresh run of daily-picks.yml. Alert suppressed unless that run also fails."
+            echo "retried=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Dispatch failed — falling through to the alert."
+            echo "retried=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Self-alert on failure (ops-alert workflow_run delivery is unreliable for this job)
+        if: (failure() || cancelled()) && steps.selfretry.outputs.retried != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          TITLE="🚨 Scheduled workflow failing: Daily picks save + score"
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "in:title \"$TITLE\"" --json number,title \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -1)
+          BODY="[Daily picks save + score]($RUN_URL) failed at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY"
+            echo "Commented on existing issue #$EXISTING"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" \
+              --body "$BODY
+
+          Close this issue once the workflow is green again. Repeat failures will be added as comments here instead of new issues."
+            echo "Opened new issue"
+          fi

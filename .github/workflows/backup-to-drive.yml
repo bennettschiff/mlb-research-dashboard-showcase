@@ -1,0 +1,173 @@
+name: Nightly Supabase → Drive backup
+
+# Runs 09:30 UTC (5:30 AM ET). Full snapshot on Sundays, incremental the rest of
+# the week (see the Dump step and scripts/backup-to-drive.mjs).
+on:
+  # Production runs this on a cron schedule. The public copy is manual-only,
+  # so a fork without secrets never fires it.
+  workflow_dispatch:
+    inputs:
+      tables:
+        description: 'Comma-separated table list (blank = all)'
+        required: false
+        default: ''
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          check-latest: true   # runner cache lags security releases
+
+      # `apt-get update` refreshes EVERY source on the runner image, including
+      # third-party ones this job has no use for, and one broken source fails
+      # the whole command. On 2026-08-29 Microsoft's
+      # packages.microsoft.com/ubuntu/24.04/prod repo went unsigned and killed
+      # the WNBA lab's backup with exit 100 — on an rclone install that only
+      # ever needed Ubuntu's own archive. Drop the third-party lists first, and
+      # fall back to rclone.org's published .deb if apt is unusable for any
+      # other reason, so a rotten runner-image repo can't cost a night of
+      # backups. Both labs' backup jobs carry this identical step.
+      - name: Install rclone
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft-prod.list \
+                     /etc/apt/sources.list.d/microsoft.list
+          if sudo apt-get update -qq && sudo apt-get install -y -qq rclone; then
+            rclone version
+          else
+            echo "apt unusable — falling back to rclone.org's .deb"
+            curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.deb -o /tmp/rclone.deb
+            sudo dpkg -i /tmp/rclone.deb
+            rclone version
+          fi
+
+      # FULL dump on Sundays (and any manual run); INCREMENTAL the other days —
+      # only the big append tables (scan blobs, pick_signals, mining_findings)
+      # are limited to a 3-day rolling window, cutting Supabase egress from
+      # ~180 MB/night to ~25 MB while every other table stays full. Restore =
+      # latest full/ folder + later incremental/ folders (see the script header).
+      - name: Dump tables
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LAB_SUPABASE_URL: ${{ secrets.LAB_SUPABASE_URL }}
+          LAB_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.LAB_SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          ARGS="--out-dir=backup-out"
+          if [ -n "${{ github.event.inputs.tables }}" ]; then
+            ARGS="$ARGS --tables=${{ github.event.inputs.tables }}"
+          fi
+          if [ "${{ github.event_name }}" = "schedule" ] && [ "$(date -u +%u)" != "7" ]; then
+            ARGS="$ARGS --since=$(date -u -d '3 days ago' +%F)"
+            MODE=incremental
+          else
+            MODE=full
+          fi
+          echo "BACKUP_MODE=$MODE" >> "$GITHUB_ENV"
+          node scripts/backup-to-drive.mjs $ARGS
+
+      # `if: always()` because a dump that lost one table to a transient stall
+      # still exits 1 (see the script's tail) — and the nineteen tables it DID
+      # read are exactly what you want on Drive when the database is having a
+      # bad night. The job still goes red, so ops-alert fires; the prune step
+      # below stays skipped, so nothing is deleted against a partial archive.
+      - name: Upload to Google Drive
+        if: always()
+        env:
+          RCLONE_CONF: ${{ secrets.RCLONE_CONF }}
+        run: |
+          mkdir -p ~/.config/rclone
+          printf '%s' "$RCLONE_CONF" > ~/.config/rclone/rclone.conf
+          DATE=$(date -u +%F)
+          # Empty only if the dump step died before it could classify the run —
+          # don't file that under full/ or incremental/ and corrupt a restore.
+          rclone copy backup-out "gdrive:mlb-research-dashboard-backups/${BACKUP_MODE:-unknown}/$DATE" --transfers 4 -v
+
+      # The COLD ARCHIVES (scripts/lib/{scan,signals}-archive.mjs). Distinct from
+      # the dated backup folders above: a backup is a restore artefact nobody
+      # reads, while these are the substrate the lab jobs now read INSTEAD of
+      # Postgres. Sync appends only what is new (a 3-day overlapping window, so a
+      # missed night self-heals) and pushes to
+      # gdrive:mlb-research-dashboard-archive/{pick-signals,daily-scan-results}.
+      #
+      # NOT `if: always()`: a partial dump above means the instance is having a
+      # bad night, and the sync would re-read the same rows that just failed.
+      # LAB credentials are NOT optional here: --sync covers the three LAB panel
+      # tables (player_day_features, batter/pitcher_asof_features) as well as the
+      # two SERVE ones, and _lab.mjs exits non-zero on a missing LAB_ var rather
+      # than silently syncing half of what the verify step is about to check.
+      - name: Sync cold archives (SERVE + LAB)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LAB_SUPABASE_URL: ${{ secrets.LAB_SUPABASE_URL }}
+          LAB_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.LAB_SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/archive.mjs --sync
+
+      # THE GUARD ON THE PRUNE BELOW. The archive is the only durable copy of
+      # anything the next step deletes, so this fails the job (exit 2) if a single
+      # row or date in Postgres is missing from Drive — and because the prune runs
+      # after it, a failed verify means nothing is deleted. Never reorder these.
+      - name: Verify archives cover Postgres
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LAB_SUPABASE_URL: ${{ secrets.LAB_SUPABASE_URL }}
+          LAB_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.LAB_SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/archive.mjs --verify
+
+      # daily_scan_results grows ~1.9 MB/day (2 MB jsonb blobs) and was the largest
+      # table on SERVE.
+      #
+      # 14 days, cut from 35 on 2026-09-08 when the Drive archive took over the
+      # history. The old 35 was sized to be "the largest trim that costs no
+      # analysis anything", because Postgres was the ONLY copy and every backtest
+      # read it — which meant the pruner silently capped alt-line-backtest,
+      # calibrate-retune and fit-blend at 35 days too. They now read the archive,
+      # which holds 2026-05-02 → today, so trimming Postgres makes the analysis
+      # substrate LONGER, not shorter.
+      #
+      # 14 is set by the deepest remaining Postgres-side reader, not by taste:
+      # brain-trust-snapshot's backfillMissing(daysBack = 5). api/scan-results.js
+      # serves the requested date (today) and api/_freshness.js reads only the max.
+      # 14 leaves ~3x headroom over the 5-day consumer.
+      #
+      # Deletes one game_date at a time — a single bulk DELETE of many ~2 MB rows
+      # hits the Postgres statement timeout (CLAUDE.md), and the old `curl ... || true`
+      # form swallowed that failure silently, letting the table balloon. The script
+      # fails loudly so ops-alert catches a stuck prune (2026-06-27 incident).
+      - name: Prune scan blobs older than 14 days (archived + verified above)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/prune-scan-results.mjs --days=14 --apply
+
+      # pick_signals had NO retention until 2026-09-08, because feature-lab,
+      # loss-profile, clv-miner and mining-cron all read its FULL history with no
+      # date filter. They read the Drive archive now, so 14 days is safe here too —
+      # set by plumbing-tripwire's 7-day window, the deepest Postgres-side reader.
+      # Gated by the same verify step above: a failed verify skips this.
+      - name: Prune pick_signals older than 14 days (archived + verified above)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/prune-pick-signals.mjs --days=14 --apply
+
+      # The LAB half of the same migration: player_day_features (176 MB) and the
+      # two asof tables (78 MB) were 254 MB of LAB's 367 MB, all batch-read
+      # analysis substrate. Same 14-day window, set here by brain-trust-snapshot's
+      # 5-day backfill and sanity-check's daysAgo(4)..daysAgo(1) assertion.
+      # mining_findings stays in Postgres — api/findings.js is a live relay for
+      # the Findings tab — and mining-cron already prunes it to 14 days itself.
+      # The script re-checks Drive coverage per table before deleting, so it is
+      # safe even if the verify step above were ever reordered away.
+      - name: Prune LAB panel tables older than 14 days (archived + verified above)
+        env:
+          LAB_SUPABASE_URL: ${{ secrets.LAB_SUPABASE_URL }}
+          LAB_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.LAB_SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/prune-lab-panel.mjs --days=14 --apply

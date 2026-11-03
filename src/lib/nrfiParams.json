@@ -1,0 +1,112 @@
+{
+ "version": "public-1",
+ "league": {
+  "L0_TOP": 0.7,
+  "L0_BOT": 0.7,
+  "L0_HALF": 0.7,
+  "LEAGUE_RPG": 4.4,
+  "LEAGUE_FIP": 4.2,
+  "LEAGUE_KBB": 0.1,
+  "LEAGUE_OPS": 0.7,
+  "FIP_C": 3.1,
+  "runsGivenRunTop": 1.7,
+  "runsGivenRunBot": 1.8
+ },
+ "shrink": {
+  "K_PIT": 12,
+  "K_TEAM": 18,
+  "W_PRIOR_PIT": 0.6,
+  "W_PRIOR_TEAM": 0.4,
+  "W_PRIOR_BAT": 0.6,
+  "LINEUP_W": [
+   1,
+   1,
+   1,
+   0.7,
+   0.4,
+   0.2
+  ]
+ },
+ "venueDev": {
+  "Tokyo Dome": 0,
+  "Petco Park": 0,
+  "Dodger Stadium": 0,
+  "T-Mobile Park": 0,
+  "Busch Stadium": 0,
+  "Chase Field": 0,
+  "Globe Life Field": 0,
+  "Rate Field": 0,
+  "Nationals Park": 0,
+  "Rogers Centre": 0,
+  "Yankee Stadium": 0,
+  "Kauffman Stadium": 0,
+  "Daikin Park": 0,
+  "Great American Ball Park": 0,
+  "loanDepot park": 0,
+  "George M. Steinbrenner Field": 0,
+  "Sutter Health Park": 0,
+  "Citizens Bank Park": 0,
+  "American Family Field": 0,
+  "Oriole Park at Camden Yards": 0,
+  "Target Field": 0,
+  "Oracle Park": 0,
+  "Angel Stadium": 0,
+  "Coors Field": 0,
+  "Comerica Park": 0,
+  "Wrigley Field": 0,
+  "PNC Park": 0,
+  "Fenway Park": 0,
+  "Truist Park": 0,
+  "Citi Field": 0,
+  "Progressive Field": 0,
+  "Bristol Motor Speedway": 0,
+  "Journey Bank Ballpark": 0
+ },
+ "priors": {
+  "pitcherFirstInn": {},
+  "teamFirstInn": {},
+  "teamRpg": {},
+  "pitcherSeason": {},
+  "batterSeason": {}
+ },
+ "gbm": {
+  "base": 0.3,
+  "lr": 0.1,
+  "trees": [
+   {
+    "j": 2,
+    "t": 0,
+    "vL": -0.1,
+    "vR": 0.1
+   },
+   {
+    "j": 3,
+    "t": 0,
+    "vL": -0.1,
+    "vR": 0.1
+   }
+  ]
+ },
+ "platt": [
+  0,
+  1
+ ],
+ "tiers": {
+  "nrfiStrong": 0.62,
+  "nrfiLean": 0.56,
+  "yrfiLean": 0.46,
+  "yrfiStrong": 0.4,
+  "median": 0.52
+ },
+ "featOrder": [
+  "isBottom",
+  "pitInnDev",
+  "offInnDev",
+  "fipDev",
+  "kbbDev",
+  "lineupDev",
+  "rpgDev",
+  "vDev"
+ ],
+ "_comment": "Illustrative values only; production NRFI parameters are private."
+}

@@ -1,0 +1,110 @@
+name: Morning score (yesterday's picks)
+
+# Why this exists: grade yesterday's pending picks first thing in the morning so
+# the model/results pages show how it did overnight, instead of waiting for the
+# 12:30 PM ET save+score run (daily-picks.yml owns the save path).
+#
+# Why the server-side scorer (not the Playwright driver): the in-browser
+# auto-score useEffect grades 0 picks in headless Chromium — it burns the full
+# 15-min poll on a fully-final slate and times out with no progress (observed
+# 2026-06-14, 62/62 final-game picks left pending, no network errors). The
+# data path is fine; the React effect just doesn't grade unattended. So this
+# run uses scripts/backfill-scores.mjs, which mirrors scorePicks() exactly but
+# runs as plain Node against the MLB Stats API — no browser, no flaky effect,
+# ~30s instead of ~3 min, and it actually works.
+#
+# --apply grades every cleanly-gradeable pick (truthful win/loss/push). It does
+# NOT pass --void-ungradeable: DNPs and (rarely) still-suspended games are left
+# pending rather than auto-pushed, since a 7 AM auto-void could prematurely
+# settle a game that resumes later. Sweep those with a manual
+# `backfill-scores.mjs --apply --void-ungradeable` when needed.
+#
+# Schedule (cron is UTC; ET shown is DST offset, UTC-4 — cron does NOT auto-adjust
+# for DST, matching the rest of this repo's workflows):
+#   - 07:45 UTC = 3:45 AM ET (DST). Early pass so the pre-dawn lab chain
+#     (lab-analyst.yml 08:15 UTC → local Claude analyst routines ~4:35/4:50 AM)
+#     sees yesterday's grades. West-coast games are final by ~1:30 AM ET; a
+#     marathon still live at 3:45 just stays pending for the backup pass.
+#   - 11:00 UTC = 7:00 AM ET (DST). Backup pass — all of yesterday's games are
+#     final by now, so anything the early pass left pending grades cleanly.
+
+on:
+  # Production runs this on a cron schedule. The public copy is manual-only,
+  # so a fork without secrets never fires it.
+  workflow_dispatch:
+
+jobs:
+  score:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          check-latest: true   # runner cache lags security releases
+
+      - name: Score yesterday's pending picks
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LAB_SUPABASE_URL: ${{ secrets.LAB_SUPABASE_URL }}
+          LAB_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.LAB_SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/backfill-scores.mjs --apply
+
+      # Golden boards (server-side). The "Yesterday's Golden Boards" tables on the
+      # Results page only render when golden_snapshots rows exist for the date, and
+      # those rows used to be written ONLY by the client-side first-pitch lock — so
+      # on any day nobody opened the Golden tab the table silently vanished.
+      #
+      # Since 2026-08-06 this writes THREE rows (likely / lines / value, keyed
+      # (pick_date, board)) selected from brain_trust_snapshots.predictions — the
+      # per-line surface with standard + alternate prices attached. Selection math
+      # is src/lib/goldenBoards.js, shared with the UI.
+      #
+      # DEPENDENCY: needs that date's Brain Trust snapshot, which is written
+      # same-day, so by this 7 AM run it is present. Grading is NOT done here —
+      # it needs player_day_features.outcomes, which lands at 9 AM in
+      # player-day-panel.yml ("Grade Golden boards").
+      #
+      # BACKSTOP ONLY — no --force. daily-picks.yml writes each board at 12:30 PM
+      # ET on the slate day itself, and that noon board is what the Golden tab
+      # showed all day; rebuilding it here would re-select from an mlb_picks NRFI
+      # pool the 6 PM backstop may have since updated, silently rewriting a board
+      # the user already saw as locked. buildGoldenSnapshot only counts a board as
+      # written when it has picks, so a board that came up empty at noon still
+      # gets filled here.
+      - name: Snapshot yesterday's Golden boards
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LAB_SUPABASE_URL: ${{ secrets.LAB_SUPABASE_URL }}
+          LAB_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.LAB_SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          YESTERDAY=$(TZ=America/New_York date -d '1 day ago' +%F)
+          echo "Building Golden boards for $YESTERDAY"
+          node scripts/golden-snapshot.mjs "$YESTERDAY"
+
+      # NOTE: Brain Trust parlay grading moved to player-day-panel.yml (9 AM ET). It
+      # depends on player_day_features.outcomes, which that job writes; running it here
+      # at 7 AM raced the outcome write by ~2h and left the record stuck (soft-skipped
+      # every day, never retried). See that workflow's "Grade Brain Trust" step.
+
+      # Edge controller — the closed feedback loop. Now that yesterday's picks
+      # are graded, recompute each market's rolling 30d health (cash, P/L, CLV,
+      # calibration gap) and derive today's bounded controls (active/throttled/
+      # suspended + unit multiplier + rolling prob-shift) into market_health.
+      # The app reads them via /api/picks?view=market-health: suggested units and the
+      # weighted P/L track scale by unit_mult; the EV lens applies prob_shift.
+      # Rules live in src/lib/marketHealth.js, frozen by marketHealth.test.js.
+      - name: Run edge controller (market health → sizing controls)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LAB_SUPABASE_URL: ${{ secrets.LAB_SUPABASE_URL }}
+          LAB_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.LAB_SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/edge-controller.mjs

@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MLB Research Dashboard</title>
+    <style>
+      html, body, #root {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        background: #050d1a;
+      }
+      html, body {
+        min-height: 100vh;
+        min-height: 100dvh;
+      }
+      /* Prevent content overflow from widening the viewport on mobile, which
+         makes the browser zoom out to fit it all on screen.
+         `clip` — NOT `hidden`. On iOS Safari, overflow-x:hidden on html/body
+         promotes html into its own scroll container, which breaks momentum
+         scrolling and makes the page seize whenever a touch gesture starts on
+         a nested horizontal scroller (the splits tables). `clip` suppresses
+         the overflow without creating a scroll container. */
+      html, body, #root {
+        overflow-x: clip;
+      }
+      body {
+        /* Don't chain rubber-band from inner scrollers up to the document. */
+        overscroll-behavior-y: none;
+        -webkit-text-size-adjust: 100%;
+      }
+      /* iOS Safari zooms in when focusing inputs with font-size < 16px.
+         Force all inputs to 16px on mobile so the viewport never shifts. */
+      @media (max-width: 768px) {
+        input, select, textarea {
+          font-size: 16px !important;
+        }
+      }
+
+      /* ── Horizontal table scrollers ────────────────────────────────────────
+         Every wide table (splits, boards, leaders) lives in one of these. The
+         combination below is what keeps vertical page scrolling alive when a
+         finger lands on the table:
+           touch-action: pan-x pan-y  → let the browser own both axes so a
+             mostly-vertical drag scrolls the page instead of being swallowed
+             by the table's axis lock.
+           overscroll-behavior-x: contain → don't chain sideways overscroll
+             into the document (which on iOS triggers back-swipe navigation
+             and looks like a freeze).                                        */
+      .hscroll {
+        overflow-x: auto;
+        overflow-y: hidden;
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior-x: contain;
+        touch-action: pan-x pan-y;
+        max-width: 100%;
+      }
+      /* Thin, unobtrusive scrollbar so it's discoverable that these scroll. */
+      .hscroll::-webkit-scrollbar { height: 5px; }
+      .hscroll::-webkit-scrollbar-thumb {
+        background: rgba(32, 98, 200, 0.28);
+        border-radius: 3px;
+      }
+      .hscroll::-webkit-scrollbar-track { background: transparent; }
+
+      /* Sticky first column for wide stat tables: the row label (split name,
+         player, season) stays pinned while the numbers scroll under it. */
+      .hscroll table .stickcol {
+        position: sticky;
+        left: 0;
+        z-index: 2;
+        background: var(--stick-bg, #eef2f9);
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

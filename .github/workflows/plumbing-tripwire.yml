@@ -1,0 +1,87 @@
+name: Plumbing tripwire (daily)
+
+# Deterministic daily replacement for the LLM plumbing-audit agent.
+#
+# The agent cost ~$14/run to conclude "everything is clean" on most days, which
+# was ~$99/wk of weekly Claude usage for a job that is entirely mechanical
+# assertions (2026-07-21 burn review). Those assertions live in
+# scripts/plumbing-tripwire.mjs and run here for free. The agent is now woken
+# only when this trips — so Savant/ETL coverage is DAILY and unconditional,
+# and keeps working even when Claude usage is capped.
+#
+# Runs at 07:15 UTC (3:15 AM ET) — deliberately ahead of the whole pre-dawn
+# chain (morning-score 3:45, lab-analyst 4:15, analyst panel 4:35, edge scout
+# 5:15) so a broken pipe is known BEFORE anything analyzes it and files
+# confident proposals on dead data.
+#
+# Registered in ops-alert.yml, so a non-zero exit opens a GitHub issue.
+
+#
+# The 07:15 slot alone was structurally blind to half the pipeline: it lands
+# SIX HOURS before the 13:00 UTC player-day panel, so it could only ever judge
+# yesterday's run of everything in the midday chain. On 2026-08-28 the panel's
+# run was never delivered and the morning tripwire had, correctly and uselessly,
+# reported the previous day as clean. The 15:30 slot closes that: it runs after
+# the 12:00 ETL, the 13:00 panel and the 13:30 mining engine, so the same
+# assertions finally cover the jobs they were written for.
+
+on:
+  # Production runs this on a cron schedule. The public copy is manual-only,
+  # so a fork without secrets never fires it.
+  workflow_dispatch:
+
+# `actions: read` is what lets cron-watchdog.mjs list workflow runs. Without it
+# the GitHub API answers "Repository not found" — a 404 that reads like a wrong
+# repo name and is really a missing permission (2026-07-16).
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  tripwire:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          check-latest: true   # runner cache lags security releases
+
+      - name: Savant schema drift
+        # Upstream column renames are the other half of "is Savant still feeding".
+        # Was weekly-only; a rename could sit dead for six days. Costs nothing to
+        # run daily alongside the DB-layer checks.
+        run: node scripts/savant-schema-audit.mjs
+
+      - name: Plumbing tripwire
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          LAB_SUPABASE_URL: ${{ secrets.LAB_SUPABASE_URL }}
+          LAB_SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.LAB_SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/plumbing-tripwire.mjs
+
+      # `if: always()` on purpose, and it is the whole point of this step: a
+      # tripwire failure above must not stop the beacon from being written, or
+      # the dashboard would report "watchdog silent" (scheduler down) on a day
+      # the watchdog ran fine and simply found something. It also has to run on
+      # the days the tripwire trips, because those are the days it matters.
+      - name: Cron delivery watchdog + beacon
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: node scripts/cron-watchdog.mjs
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: plumbing-tripwire-report
+          path: |
+            docs/plumbing-tripwire-latest.json
+            docs/cron-watchdog-latest.json
+          if-no-files-found: ignore

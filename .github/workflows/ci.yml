@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    # The daily automated commits (mining reports, lab-analyst ledger, edge-scout /
+    # plumbing docs) touch only these artifact paths and can't affect tests or the
+    # build — skip CI for them (2026-07-25 burn review). A commit that ALSO touches
+    # code still runs CI, because paths-ignore skips only when EVERY changed file matches.
+    paths-ignore:
+      - '**/*.md'
+      - 'lab/**'
+      - 'docs/**'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+      - 'lab/**'
+      - 'docs/**'
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          check-latest: true   # runner cache lags security releases
+          cache: npm
+      - run: npm ci
+      # Stand-in for GitHub secret scanning, which is a paid add-on on private
+      # repos. Sweeps ALL tracked files (not just this push's diff), so it still
+      # covers the lab/docs/md paths that paths-ignore keeps CI from firing on.
+      # Runs before test/build: it takes seconds and should fail fast.
+      - run: npm run scan:secrets
+      - run: npm test
+      # Does every job that READS the Drive cold archive also set rclone up? The
+      # 09-08 migration moved the cold tables to Drive and updated the readers but
+      # not the five workflows that run them; they kept passing on data still
+      # inside the 14-day Postgres window and then failed one at a time as it aged
+      # out (mining-engine, 09-09). Static, seconds, no network.
+      - run: npm run check:archive-workflows
+      - run: npm run build

@@ -1,0 +1,6 @@
+# Test files must never be deployed: Vercel turns every non-underscore .js file
+# in api/ into a Serverless Function, and the Hobby plan caps a deployment at 12.
+# api/scan-results.test.js (added in ac110f9) was counted as a 13th function and
+# broke every production deploy with exceeded_serverless_functions_per_deployment.
+# Tests run in CI/local via vitest, never on Vercel.
+**/*.test.js
